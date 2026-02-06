@@ -2,6 +2,8 @@
 
 A PipeWire module that creates a virtual audio sink and transmits audio over the network using the Scream protocol.
 
+**Part of the [Scream](https://github.com/duncanthrax/scream) ecosystem** - This is a Linux PipeWire implementation of the Scream sender. For receivers and the original Windows driver, see the [main Scream project](https://github.com/duncanthrax/scream).
+
 ## ⚠️ AI-Generated Code Notice
 
 **This project was automatically generated using GitHub Copilot CLI with minimal human intervention.**

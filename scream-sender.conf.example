@@ -1,0 +1,73 @@
+# Scream PipeWire Sender Module Configuration
+#
+# Place this file in ~/.config/pipewire/pipewire.conf.d/scream-sender.conf
+#
+# Then restart PipeWire: systemctl --user restart pipewire
+
+context.modules = [
+    {
+        name = libpipewire-module-scream
+        args = {
+            # Sink properties
+            sink.name = "Scream"
+            sink.description = "Scream Network Sink"
+            
+            # Network configuration
+            # For multicast (default):
+            # ip = "239.255.77.77"
+            
+            # For unicast to a specific receiver:
+            # ip = "192.168.1.100"
+            
+            # Port (default: 4010)
+            # port = 4010
+            
+            # Network interface (optional)
+            # interface = "eth0"
+            # interface = "192.168.1.50"
+            
+            # Audio format (default: 48000 Hz, 2 channels, S16LE)
+            # rate = 48000
+            # channels = 2
+            # format = "S16LE"    # Options: S16LE, S24LE, S32LE
+        }
+    }
+]
+
+# Example configurations:
+
+# Multicast to default group (239.255.77.77:4010)
+# context.modules = [
+#     { name = libpipewire-module-scream }
+# ]
+
+# Unicast to specific receiver
+# context.modules = [
+#     {
+#         name = libpipewire-module-scream
+#         args = {
+#             ip = "192.168.1.100"
+#         }
+#     }
+# ]
+
+# High quality audio (96kHz, 24-bit)
+# context.modules = [
+#     {
+#         name = libpipewire-module-scream
+#         args = {
+#             rate = 96000
+#             format = "S24LE"
+#         }
+#     }
+# ]
+
+# 5.1 surround sound
+# context.modules = [
+#     {
+#         name = libpipewire-module-scream
+#         args = {
+#             channels = 6
+#         }
+#     }
+# ]

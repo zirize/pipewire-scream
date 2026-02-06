@@ -2,6 +2,17 @@
 
 A PipeWire module that creates a virtual audio sink and transmits audio over the network using the Scream protocol.
 
+## ⚠️ AI-Generated Code Notice
+
+**This project was automatically generated using GitHub Copilot CLI with minimal human intervention.**
+
+- The source code, build system, and documentation were created through AI assistance
+- While functional and tested, users should exercise caution and review the code before use in production environments
+- Contributions, code reviews, and bug reports are especially welcome to improve reliability
+- No warranty is provided - use at your own risk (see LICENSE for details)
+
+If you encounter issues, please report them on the [GitHub Issues](https://github.com/zirize/pipewire-scream/issues) page.
+
 ## Overview
 
 This module provides Linux/PipeWire equivalent functionality to the Windows Scream driver. Audio played to the virtual sink is transmitted as raw PCM over UDP (multicast or unicast) to Scream receivers on the network.

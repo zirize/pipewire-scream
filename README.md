@@ -123,10 +123,11 @@ context.modules = [
 | `sink.name` | string | `Scream` | Name of the virtual sink |
 | `sink.description` | string | `Scream Network Sink` | Description shown in audio settings |
 | `ip` | string | `239.255.77.77` | Destination IP (multicast or unicast) |
-| `port` | int | `4010` | Destination UDP port |
+| `port` | int | `4010` | Destination UDP port (1-65535) |
 | `interface` | string | (auto) | Network interface to use |
-| `rate` | int | `48000` | Default sample rate |
-| `channels` | int | `2` | Default channel count |
+| `multicast.ttl` | int | `1` | Multicast TTL (1-255) |
+| `rate` | int | `48000` | Default sample rate (8000-384000) |
+| `channels` | int | `2` | Default channel count (1-255) |
 | `format` | string | `S16LE` | Audio format (S16LE, S24LE, S32LE) |
 
 ## Receivers

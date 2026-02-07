@@ -53,9 +53,55 @@
 #define SCREAM_HEADER_SIZE 5
 #define SCREAM_MAX_PAYLOAD 1152
 
+/* Configuration limits */
+#define MIN_SAMPLE_RATE 8000
+#define MAX_SAMPLE_RATE 384000
+#define MIN_CHANNELS 1
+#define MAX_CHANNELS 255
+#define MIN_PORT 1
+#define MAX_PORT 65535
+#define DEFAULT_MULTICAST_TTL 1
+#define MAX_MULTICAST_TTL 255
+#define PARAM_BUFFER_SIZE 1024
+#define MAX_CONSECUTIVE_SEND_FAILURES 100
+
 /* Sample rate encoding for Scream protocol */
 #define RATE_BASE_48K 0
 #define RATE_BASE_44K 1
+
+/* Parse integer parameter with validation */
+static int parse_int_param(const char *str, const char *param_name, 
+                           long min_val, long max_val, long *result)
+{
+    char *endptr;
+    long value;
+    
+    if (!str) {
+        return -EINVAL;
+    }
+    
+    errno = 0;
+    value = strtol(str, &endptr, 10);
+    
+    if (errno != 0) {
+        pw_log_error("Failed to parse %s: %s", param_name, strerror(errno));
+        return -errno;
+    }
+    
+    if (*endptr != '\0') {
+        pw_log_error("Invalid %s (not a number): %s", param_name, str);
+        return -EINVAL;
+    }
+    
+    if (value < min_val || value > max_val) {
+        pw_log_error("Invalid %s %ld (must be %ld-%ld)", 
+                     param_name, value, min_val, max_val);
+        return -EINVAL;
+    }
+    
+    *result = value;
+    return 0;
+}
 
 struct scream_sink_data {
     struct pw_impl_module *module;
@@ -74,6 +120,7 @@ struct scream_sink_data {
     char *ip;
     int port;
     char *interface;
+    unsigned char multicast_ttl;
     
     /* Sink properties */
     char *sink_name;
@@ -84,6 +131,9 @@ struct scream_sink_data {
     
     /* Scream protocol state */
     uint8_t packet_buffer[SCREAM_HEADER_SIZE + SCREAM_MAX_PAYLOAD];
+    
+    /* Error tracking */
+    unsigned int consecutive_send_failures;
 };
 
 /* Module properties */
@@ -242,7 +292,19 @@ static void on_stream_process(void *userdata)
     size = d[0].chunk->size;
 
     uint32_t sample_size = get_sample_size(&data->format);
-    uint32_t bytes_per_frame = sample_size * data->format.channels;
+    uint32_t channels = data->format.channels;
+    
+    /* Prevent integer overflow in bytes_per_frame calculation */
+    if (sample_size > 0 && channels > 0) {
+        /* Check if multiplication would overflow */
+        if (channels > UINT32_MAX / sample_size) {
+            pw_log_error("Integer overflow in frame size calculation: sample_size=%u channels=%u",
+                        sample_size, channels);
+            goto done;
+        }
+    }
+    
+    uint32_t bytes_per_frame = sample_size * channels;
     if (bytes_per_frame == 0) {
         pw_log_error("Bytes per frame is zero, aborting processing.");
         goto done;
@@ -257,8 +319,19 @@ static void on_stream_process(void *userdata)
         uint32_t chunk_size = (remaining > max_payload_bytes) ? 
                               max_payload_bytes : remaining;
 
-        if (chunk_size > 0 && send_scream_packet(data, src + offset, chunk_size) < 0) {
-            pw_log_debug("Failed to send packet, offset=%u size=%u", offset, size);
+        if (chunk_size > 0) {
+            if (send_scream_packet(data, src + offset, chunk_size) < 0) {
+                data->consecutive_send_failures++;
+                if (data->consecutive_send_failures >= MAX_CONSECUTIVE_SEND_FAILURES) {
+                    pw_log_error("Too many consecutive send failures (%u), network may be down",
+                                data->consecutive_send_failures);
+                    /* Reset counter to avoid log spam */
+                    data->consecutive_send_failures = 0;
+                }
+            } else {
+                /* Reset failure counter on success */
+                data->consecutive_send_failures = 0;
+            }
         }
         offset += chunk_size;
     }
@@ -358,9 +431,10 @@ static int init_network(struct scream_sink_data *data)
                    &broadcast, sizeof(broadcast));
         
         /* Set multicast TTL */
-        unsigned char ttl = 1;
         setsockopt(data->sockfd, IPPROTO_IP, IP_MULTICAST_TTL, 
-                   &ttl, sizeof(ttl));
+                   &data->multicast_ttl, sizeof(data->multicast_ttl));
+        
+        pw_log_info("Multicast TTL set to %u", data->multicast_ttl);
         
         /* Set multicast interface if specified */
         if (data->interface) {
@@ -382,7 +456,7 @@ static int init_network(struct scream_sink_data *data)
 static int create_sink_stream(struct scream_sink_data *data, struct pw_properties *props)
 {
     const struct spa_pod *params[1];
-    uint8_t buffer[1024];
+    uint8_t buffer[PARAM_BUFFER_SIZE];
     struct spa_pod_builder b = SPA_POD_BUILDER_INIT(buffer, sizeof(buffer));
     int ret;
 
@@ -474,25 +548,23 @@ static void module_destroy(void *data)
     
     pw_log_info("Module destroy called");
     
-    /* Note: PipeWire automatically cleans up all PipeWire objects (stream, core, listeners)
-     * when the context is destroyed. We MUST NOT touch them here.
-     * Only clean up our own resources: socket and memory.
-     */
-    
+    /* Clean up socket */
     if (d->sockfd >= 0) {
         pw_log_info("Closing socket...");
         close(d->sockfd);
+        d->sockfd = -1;
     }
     
+    /* Free allocated strings */
     pw_log_info("Freeing memory...");
     free(d->ip);
+    d->ip = NULL;
     free(d->interface);
+    d->interface = NULL;
     free(d->sink_name);
+    d->sink_name = NULL;
     free(d->sink_description);
-    
-    /* Do NOT free(d) here! PipeWire may still need to access the module data
-     * after this callback returns. Let it manage the lifecycle.
-     */
+    d->sink_description = NULL;
     
     pw_log_info("Module destroy complete");
 }
@@ -522,6 +594,8 @@ int pipewire__module_init(struct pw_impl_module *module, const char *args)
 
     data->module = module;
     data->sockfd = -1;
+    data->multicast_ttl = DEFAULT_MULTICAST_TTL;
+    data->consecutive_send_failures = 0;
 
     props = args ? pw_properties_new_string(args) : pw_properties_new(NULL, NULL);
     if (!props) {
@@ -538,11 +612,9 @@ int pipewire__module_init(struct pw_impl_module *module, const char *args)
 
     str = pw_properties_get(props, "port");
     if (str) {
-        char *endptr;
-        long port = strtol(str, &endptr, 10);
-        if (*endptr != '\0' || port < 1 || port > 65535) {
-            pw_log_error("Invalid port number: %s", str);
-            ret = -EINVAL;
+        long port;
+        ret = parse_int_param(str, "port", MIN_PORT, MAX_PORT, &port);
+        if (ret < 0) {
             goto error;
         }
         data->port = (int)port;
@@ -558,6 +630,16 @@ int pipewire__module_init(struct pw_impl_module *module, const char *args)
             goto error;
         }
     }
+    
+    str = pw_properties_get(props, "multicast.ttl");
+    if (str) {
+        long ttl;
+        ret = parse_int_param(str, "multicast.ttl", 1, MAX_MULTICAST_TTL, &ttl);
+        if (ret < 0) {
+            goto error;
+        }
+        data->multicast_ttl = (unsigned char)ttl;
+    }
 
     if ((ret = init_network(data)) < 0) {
         goto error;
@@ -565,11 +647,9 @@ int pipewire__module_init(struct pw_impl_module *module, const char *args)
 
     str = pw_properties_get(props, "rate");
     if (str) {
-        char *endptr;
-        long rate = strtol(str, &endptr, 10);
-        if (*endptr != '\0' || rate < 8000 || rate > 384000) {
-            pw_log_error("Invalid sample rate: %s", str);
-            ret = -EINVAL;
+        long rate;
+        ret = parse_int_param(str, "sample rate", MIN_SAMPLE_RATE, MAX_SAMPLE_RATE, &rate);
+        if (ret < 0) {
             goto error;
         }
         data->format.rate = (uint32_t)rate;
@@ -579,11 +659,9 @@ int pipewire__module_init(struct pw_impl_module *module, const char *args)
 
     str = pw_properties_get(props, "channels");
     if (str) {
-        char *endptr;
-        long channels = strtol(str, &endptr, 10);
-        if (*endptr != '\0' || channels < 1 || channels > 255) {
-            pw_log_error("Invalid channel count: %s", str);
-            ret = -EINVAL;
+        long channels;
+        ret = parse_int_param(str, "channels", MIN_CHANNELS, MAX_CHANNELS, &channels);
+        if (ret < 0) {
             goto error;
         }
         data->format.channels = (uint32_t)channels;
@@ -592,10 +670,18 @@ int pipewire__module_init(struct pw_impl_module *module, const char *args)
     }
     
     str = pw_properties_get(props, "format");
-    if (str && strcmp(str, "S24LE") == 0) {
-        data->format.format = SPA_AUDIO_FORMAT_S24;
-    } else if (str && strcmp(str, "S32LE") == 0) {
-        data->format.format = SPA_AUDIO_FORMAT_S32;
+    if (str) {
+        if (strcmp(str, "S16LE") == 0) {
+            data->format.format = SPA_AUDIO_FORMAT_S16;
+        } else if (strcmp(str, "S24LE") == 0) {
+            data->format.format = SPA_AUDIO_FORMAT_S24;
+        } else if (strcmp(str, "S32LE") == 0) {
+            data->format.format = SPA_AUDIO_FORMAT_S32;
+        } else {
+            pw_log_error("Invalid audio format: %s (supported: S16LE, S24LE, S32LE)", str);
+            ret = -EINVAL;
+            goto error;
+        }
     } else {
         data->format.format = SPA_AUDIO_FORMAT_S16;
     }

@@ -2,6 +2,27 @@
 
 All notable changes to the PipeWire Scream Sender module will be documented in this file.
 
+## [1.0.1] - 2026-02-07
+
+### Fixed
+- Memory management improvements in module_destroy (proper NULL checks)
+- Integer overflow protection in audio frame size calculations
+- Enhanced UDP transmission error handling with failure tracking
+- Format validation now reports specific errors for invalid values
+- Standardized parameter parsing with proper error messages
+
+### Added
+- Configurable multicast TTL parameter (`multicast.ttl`)
+- Maximum consecutive send failure tracking (prevents log spam)
+- Input validation constants (MIN/MAX ranges for all parameters)
+- Helper function for consistent parameter parsing
+
+### Improved
+- Better thread safety in buffer processing
+- More robust error handling throughout the codebase
+- Clearer error messages for configuration issues
+- Code quality: eliminated magic numbers, reduced duplication
+
 ## [1.0.0] - 2026-02-06
 
 ### Added

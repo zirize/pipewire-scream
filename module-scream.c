@@ -115,6 +115,12 @@ static uint8_t encode_sample_rate(uint32_t rate)
     return (base << 7) | (multiplier & 0x7F);
 }
 
+/* Scream protocol channel masks */
+#define SCREAM_CHANNEL_MASK_MONO 0x0004
+#define SCREAM_CHANNEL_MASK_STEREO 0x0003
+#define SCREAM_CHANNEL_MASK_5_1 0x003F
+#define SCREAM_CHANNEL_MASK_7_1 0x00FF
+
 /* Create Scream protocol header */
 static void create_scream_header(struct scream_sink_data *data, uint8_t *header)
 {
@@ -141,18 +147,27 @@ static void create_scream_header(struct scream_sink_data *data, uint8_t *header)
     
     /* Channel mask (WAVEFORMATEXTENSIBLE format, little-endian) */
     uint16_t channel_mask = 0;
-    if (data->format.channels == 1) {
-        channel_mask = 0x0004; /* SPEAKER_FRONT_CENTER */
-    } else if (data->format.channels == 2) {
-        channel_mask = 0x0003; /* SPEAKER_FRONT_LEFT | SPEAKER_FRONT_RIGHT */
-    } else if (data->format.channels == 6) {
-        channel_mask = 0x003F; /* 5.1 surround */
-    } else if (data->format.channels == 8) {
-        channel_mask = 0x00FF; /* 7.1 surround */
-    } else {
-        /* Default: sequential channels (clamp to 16 channels max) */
-        uint8_t ch = data->format.channels > 16 ? 16 : data->format.channels;
-        channel_mask = (1 << ch) - 1;
+    switch (data->format.channels) {
+        case 1:
+            channel_mask = SCREAM_CHANNEL_MASK_MONO;
+            break;
+        case 2:
+            channel_mask = SCREAM_CHANNEL_MASK_STEREO;
+            break;
+        case 6:
+            channel_mask = SCREAM_CHANNEL_MASK_5_1;
+            break;
+        case 8:
+            channel_mask = SCREAM_CHANNEL_MASK_7_1;
+            break;
+        default:
+            /* Default: sequential channels (clamp to 16 channels max) */
+            if (data->format.channels > 16) {
+                channel_mask = (1 << 16) - 1;
+            } else {
+                channel_mask = (1 << data->format.channels) - 1;
+            }
+            break;
     }
     
     header[3] = channel_mask & 0xFF;
@@ -188,6 +203,22 @@ static int send_scream_packet(struct scream_sink_data *data, const void *audio_d
     return 0;
 }
 
+/* Get sample size in bytes from audio format */
+static uint32_t get_sample_size(const struct spa_audio_info_raw *format)
+{
+    switch (format->format) {
+        case SPA_AUDIO_FORMAT_S16:
+            return 2;
+        case SPA_AUDIO_FORMAT_S24:
+            return 3;
+        case SPA_AUDIO_FORMAT_S32:
+        case SPA_AUDIO_FORMAT_F32:
+            return 4;
+        default:
+            return 2;
+    }
+}
+
 /* Stream process callback - handles audio data from PipeWire */
 static void on_stream_process(void *userdata)
 {
@@ -196,62 +227,43 @@ static void on_stream_process(void *userdata)
     struct spa_data *d;
     uint8_t *src;
     uint32_t size;
-    
-    /* Get buffer from PipeWire stream */
+
     buffer = pw_stream_dequeue_buffer(data->stream);
     if (buffer == NULL) {
         return;
     }
-    
+
     d = buffer->buffer->datas;
     if (d[0].data == NULL || d[0].chunk->size == 0) {
         goto done;
     }
-    
+
     src = d[0].data;
     size = d[0].chunk->size;
-    
-    /* Calculate bytes per sample for proper alignment */
-    uint32_t sample_size = 0;
-    switch (data->format.format) {
-        case SPA_AUDIO_FORMAT_S16:
-            sample_size = 2;
-            break;
-        case SPA_AUDIO_FORMAT_S24:
-            sample_size = 3;
-            break;
-        case SPA_AUDIO_FORMAT_S32:
-        case SPA_AUDIO_FORMAT_F32:
-            sample_size = 4;
-            break;
-        default:
-            sample_size = 2;
+
+    uint32_t sample_size = get_sample_size(&data->format);
+    uint32_t bytes_per_frame = sample_size * data->format.channels;
+    if (bytes_per_frame == 0) {
+        pw_log_error("Bytes per frame is zero, aborting processing.");
+        goto done;
     }
-    uint32_t bytes_per_sample = sample_size * data->format.channels;
-    
-    /* Calculate max samples per packet to ensure whole sample alignment */
-    uint32_t max_samples_per_packet = SCREAM_MAX_PAYLOAD / bytes_per_sample;
-    uint32_t max_bytes_per_packet = max_samples_per_packet * bytes_per_sample;
-    
-    /* Split into Scream packets (aligned to sample boundaries) */
+
+    uint32_t max_payload_frames = SCREAM_MAX_PAYLOAD / bytes_per_frame;
+    uint32_t max_payload_bytes = max_payload_frames * bytes_per_frame;
+
     uint32_t offset = 0;
     while (offset < size) {
         uint32_t remaining = size - offset;
-        uint32_t chunk_size = (remaining > max_bytes_per_packet) ? 
-                              max_bytes_per_packet : remaining;
-        
-        /* Ensure we send whole samples only */
-        chunk_size = (chunk_size / bytes_per_sample) * bytes_per_sample;
-        
+        uint32_t chunk_size = (remaining > max_payload_bytes) ? 
+                              max_payload_bytes : remaining;
+
         if (chunk_size > 0 && send_scream_packet(data, src + offset, chunk_size) < 0) {
-            /* Continue even if send fails to prevent buffer buildup */
             pw_log_debug("Failed to send packet, offset=%u size=%u", offset, size);
         }
         offset += chunk_size;
     }
-    
+
 done:
-    /* Return buffer to PipeWire */
     pw_stream_queue_buffer(data->stream, buffer);
 }
 
@@ -373,23 +385,18 @@ static int create_sink_stream(struct scream_sink_data *data, struct pw_propertie
     uint8_t buffer[1024];
     struct spa_pod_builder b = SPA_POD_BUILDER_INIT(buffer, sizeof(buffer));
     int ret;
-    
-    /* Get sink name and description from properties */
-    const char *sink_name = pw_properties_get(props, "sink.name");
-    const char *sink_desc = pw_properties_get(props, "sink.description");
-    
-    data->sink_name = strdup(sink_name ? sink_name : DEFAULT_SINK_NAME);
-    data->sink_description = strdup(sink_desc ? sink_desc : DEFAULT_SINK_DESCRIPTION);
-    
+
+    const char *sink_name_str = pw_properties_get(props, "sink.name");
+    const char *sink_desc_str = pw_properties_get(props, "sink.description");
+
+    data->sink_name = strdup(sink_name_str ? sink_name_str : DEFAULT_SINK_NAME);
+    data->sink_description = strdup(sink_desc_str ? sink_desc_str : DEFAULT_SINK_DESCRIPTION);
+
     if (!data->sink_name || !data->sink_description) {
-        free(data->sink_name);
-        free(data->sink_description);
-        data->sink_name = NULL;
-        data->sink_description = NULL;
-        return -ENOMEM;
+        ret = -ENOMEM;
+        goto error;
     }
-    
-    /* Create stream properties */
+
     struct pw_properties *stream_props = pw_properties_new(
         PW_KEY_MEDIA_TYPE, "Audio",
         PW_KEY_MEDIA_CATEGORY, "Playback",
@@ -400,39 +407,27 @@ static int create_sink_stream(struct scream_sink_data *data, struct pw_propertie
         PW_KEY_NODE_NETWORK, "true",
         NULL
     );
-    
+
     if (!stream_props) {
-        free(data->sink_name);
-        free(data->sink_description);
-        data->sink_name = NULL;
-        data->sink_description = NULL;
-        return -ENOMEM;
+        ret = -ENOMEM;
+        goto error;
     }
-    
-    /* Create the stream */
+
     data->stream = pw_stream_new(data->core, data->sink_name, stream_props);
     if (!data->stream) {
-        pw_log_error("Failed to create stream");
-        free(data->sink_name);
-        free(data->sink_description);
-        data->sink_name = NULL;
-        data->sink_description = NULL;
-        return -ENOMEM;
+        ret = -ENOMEM;
+        goto error;
     }
-    
-    /* Add stream event listener */
-    pw_stream_add_listener(data->stream, &data->stream_listener,
-                           &stream_events, data);
-    
-    /* Build supported audio formats */
+
+    pw_stream_add_listener(data->stream, &data->stream_listener, &stream_events, data);
+
     params[0] = spa_format_audio_raw_build(&b, SPA_PARAM_EnumFormat,
         &SPA_AUDIO_INFO_RAW_INIT(
             .format = SCREAM_AUDIO_FORMAT,
             .rate = data->format.rate,
             .channels = data->format.channels
         ));
-    
-    /* Connect the stream as a sink (playback) */
+
     ret = pw_stream_connect(data->stream,
         PW_DIRECTION_INPUT,
         PW_ID_ANY,
@@ -440,20 +435,25 @@ static int create_sink_stream(struct scream_sink_data *data, struct pw_propertie
         PW_STREAM_FLAG_RT_PROCESS |
         PW_STREAM_FLAG_AUTOCONNECT,
         params, 1);
-    
+
     if (ret < 0) {
-        pw_log_error("Failed to connect stream: %s", spa_strerror(ret));
-        pw_stream_destroy(data->stream);
-        data->stream = NULL;
-        free(data->sink_name);
-        free(data->sink_description);
-        data->sink_name = NULL;
-        data->sink_description = NULL;
-        return ret;
+        goto error;
     }
-    
+
     pw_log_info("Created sink stream: %s", data->sink_name);
     return 0;
+
+error:
+    pw_log_error("Failed to create sink stream: %s", spa_strerror(ret));
+    if (data->stream) {
+        pw_stream_destroy(data->stream);
+        data->stream = NULL;
+    }
+    free(data->sink_name);
+    data->sink_name = NULL;
+    free(data->sink_description);
+    data->sink_description = NULL;
+    return ret;
 }
 
 /* Core events */
@@ -508,40 +508,34 @@ int pipewire__module_init(struct pw_impl_module *module, const char *args)
 {
     struct pw_context *context = pw_impl_module_get_context(module);
     struct scream_sink_data *data;
-    struct pw_properties *props;
+    struct pw_properties *props = NULL;
     const char *str;
-    int ret;
-    
+    int ret = 0;
+
     pw_log_info("Scream module init starting...");
-    
-    /* Allocate module data */
+
     data = calloc(1, sizeof(struct scream_sink_data));
     if (!data) {
         pw_log_error("Failed to allocate module data");
         return -ENOMEM;
     }
-    
+
     data->module = module;
     data->sockfd = -1;
-    
-    pw_log_info("Parsing module arguments...");
-    
-    /* Parse module arguments */
+
     props = args ? pw_properties_new_string(args) : pw_properties_new(NULL, NULL);
     if (!props) {
         ret = -ENOMEM;
         goto error;
     }
-    
-    /* Get IP address (default: multicast) */
+
     str = pw_properties_get(props, "ip");
     data->ip = strdup(str ? str : SCREAM_MULTICAST_GROUP);
     if (!data->ip) {
         ret = -ENOMEM;
-        goto error_props;
+        goto error;
     }
-    
-    /* Get port */
+
     str = pw_properties_get(props, "port");
     if (str) {
         char *endptr;
@@ -549,54 +543,48 @@ int pipewire__module_init(struct pw_impl_module *module, const char *args)
         if (*endptr != '\0' || port < 1 || port > 65535) {
             pw_log_error("Invalid port number: %s", str);
             ret = -EINVAL;
-            goto error_props;
+            goto error;
         }
         data->port = (int)port;
     } else {
         data->port = SCREAM_DEFAULT_PORT;
     }
-    
-    /* Get interface */
+
     str = pw_properties_get(props, "interface");
     if (str) {
         data->interface = strdup(str);
         if (!data->interface) {
             ret = -ENOMEM;
-            goto error_props;
+            goto error;
         }
     }
-    
-    /* Initialize network */
-    pw_log_info("Initializing network: %s:%d", data->ip, data->port);
-    ret = init_network(data);
-    if (ret < 0) {
-        pw_log_error("Network initialization failed: %d", ret);
-        goto error_props;
+
+    if ((ret = init_network(data)) < 0) {
+        goto error;
     }
-    
-    /* Set default audio format with validation */
+
     str = pw_properties_get(props, "rate");
     if (str) {
         char *endptr;
         long rate = strtol(str, &endptr, 10);
         if (*endptr != '\0' || rate < 8000 || rate > 384000) {
-            pw_log_error("Invalid sample rate: %s (must be 8000-384000)", str);
+            pw_log_error("Invalid sample rate: %s", str);
             ret = -EINVAL;
-            goto error_network;
+            goto error;
         }
         data->format.rate = (uint32_t)rate;
     } else {
         data->format.rate = 48000;
     }
-    
+
     str = pw_properties_get(props, "channels");
     if (str) {
         char *endptr;
         long channels = strtol(str, &endptr, 10);
         if (*endptr != '\0' || channels < 1 || channels > 255) {
-            pw_log_error("Invalid channel count: %s (must be 1-255)", str);
+            pw_log_error("Invalid channel count: %s", str);
             ret = -EINVAL;
-            goto error_network;
+            goto error;
         }
         data->format.channels = (uint32_t)channels;
     } else {
@@ -611,66 +599,45 @@ int pipewire__module_init(struct pw_impl_module *module, const char *args)
     } else {
         data->format.format = SPA_AUDIO_FORMAT_S16;
     }
-    
-    pw_log_info("Audio format: %dHz, %dch", data->format.rate, data->format.channels);
-    
-    /* Store context */
+
     data->context = context;
-    
-    /* Get core */
-    pw_log_info("Connecting to PipeWire core...");
     data->core = pw_context_connect(context, NULL, 0);
     if (!data->core) {
-        pw_log_error("Failed to connect to PipeWire core");
         ret = -errno;
-        goto error_network;
+        goto error;
     }
-    
-    /* Add core listener */
-    pw_log_info("Adding core listener...");
-    pw_core_add_listener(data->core, &data->core_listener,
-                         &core_events, data);
-    
-    /* Create PipeWire sink stream */
-    pw_log_info("Creating sink stream...");
-    ret = create_sink_stream(data, props);
-    if (ret < 0) {
-        pw_log_error("Failed to create sink stream: %d", ret);
-        goto error_core;
+
+    pw_core_add_listener(data->core, &data->core_listener, &core_events, data);
+
+    if ((ret = create_sink_stream(data, props)) < 0) {
+        goto error;
     }
-    
-    /* Register module hooks */
-    pw_log_info("Registering module hooks...");
-    pw_impl_module_add_listener(module, &data->module_listener, 
-                                 &module_events, data);
-    
+
+    pw_impl_module_add_listener(module, &data->module_listener, &module_events, data);
     pw_impl_module_update_properties(module, &SPA_DICT_INIT_ARRAY(module_props));
-    
+
     pw_log_info("Scream sender module loaded: %s:%d", data->ip, data->port);
-    
+
     pw_properties_free(props);
     return 0;
-    
-error_core:
-    pw_log_info("Error path: cleaning up core...");
-    if (data->core) {
-        pw_core_disconnect(data->core);
-    }
-error_network:
-    pw_log_info("Error path: cleaning up network...");
-    if (data->sockfd >= 0) {
-        close(data->sockfd);
-    }
-error_props:
-    pw_log_info("Error path: cleaning up props...");
-    pw_properties_free(props);
+
 error:
-    pw_log_info("Error path: cleaning up data...");
-    free(data->sink_name);
-    free(data->sink_description);
-    free(data->ip);
-    free(data->interface);
-    free(data);
     pw_log_error("Module init failed with error: %d", ret);
+    if (data) {
+        if (data->core) {
+            pw_core_disconnect(data->core);
+        }
+        if (data->sockfd >= 0) {
+            close(data->sockfd);
+        }
+        free(data->ip);
+        free(data->interface);
+        free(data->sink_name);
+        free(data->sink_description);
+        free(data);
+    }
+    if (props) {
+        pw_properties_free(props);
+    }
     return ret;
 }

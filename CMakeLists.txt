@@ -44,6 +44,7 @@ set_target_properties(pipewire-module-scream PROPERTIES
     PREFIX "libpipewire-"
     OUTPUT_NAME "module-scream"
     C_VISIBILITY_PRESET hidden
+    LINK_FLAGS "-Wl,-s"
 )
 
 # Installation

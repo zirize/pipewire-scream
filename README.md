@@ -30,6 +30,13 @@ This module provides Linux/PipeWire equivalent functionality to the Windows Scre
 - Compatible with existing Scream receivers
 - Stable for long-duration playback
 
+## Clone
+
+```bash
+git clone https://github.com/zirize/pipewire-scream.git
+cd pipewire-scream
+```
+
 ## Dependencies
 
 - PipeWire >= 0.3.0

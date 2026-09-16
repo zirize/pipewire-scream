@@ -201,8 +201,29 @@ struct module_args {
     int rate;                 // 48000
     int channels;             // 2
     char *format;             // "S16LE"
+    uint64_t silence_threshold; // 24000 frames (0.5 s at 48 kHz); 0 disables
 };
 ```
+
+### Silence suppression
+
+A PipeWire sink stays in the `running` state for as long as anything is attached to it, even
+when every attached stream is quiet. Without suppression the module therefore keeps putting
+zeroes on the wire indefinitely - roughly 1.5 Mbps for 48 kHz / 16-bit / stereo - which is the
+entire cost of the feature on a battery-powered receiver.
+
+`silence.threshold` is the number of **consecutive silent frames** tolerated before the module
+stops transmitting. It gates *stopping* only: the first non-silent buffer is sent immediately,
+so no audio is clipped at the front of a sound.
+
+| Value | Effect |
+|---|---|
+| `24000` (default) | Stop after ~0.5 s of silence at 48 kHz |
+| `0` | Never stop - transmit silence continuously (pre-1.0.2 behaviour) |
+
+This mirrors the `SilenceThreshold` registry value of the upstream Windows Scream driver.
+Receivers need no changes: the Scream protocol has no keepalive, so a receiver already cannot
+distinguish "silence" from "nothing arrived" and has to treat a gap as silence.
 
 ## Debugging
 

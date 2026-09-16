@@ -2,6 +2,21 @@
 
 All notable changes to the PipeWire Scream Sender module will be documented in this file.
 
+## [1.0.2] - 2026-09-17
+
+### Added
+- **Silence suppression** (`silence.threshold`, default 24000 frames ~= 0.5 s at 48 kHz).
+  The module now stops transmitting once the sink has been quiet for that many consecutive
+  frames, and resumes on the first non-silent buffer.
+
+  Previously the sink kept sending ~1.5 Mbps of zeroes for as long as anything was attached to
+  it. A PipeWire sink stays `running` while clients are attached even when they are all quiet,
+  so nothing in PipeWire or WirePlumber (`node.pause-on-idle`, `session.suspend-timeout-seconds`)
+  could stop it - those settings only apply once a node reports `idle`, which this one never
+  does. Set `silence.threshold = 0` to restore the previous behaviour.
+
+  Mirrors the `SilenceThreshold` registry value of the upstream Windows Scream driver.
+
 ## [1.0.1] - 2026-02-07
 
 ### Fixed

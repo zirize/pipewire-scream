@@ -30,6 +30,11 @@ context.modules = [
             # rate = 48000
             # channels = 2
             # format = "S16LE"    # Options: S16LE, S24LE, S32LE
+
+            # Silence suppression: consecutive silent frames tolerated before
+            # transmission stops. Default 24000 (~0.5 s at 48 kHz); 0 disables.
+            # Transmission resumes on the first non-silent buffer, so nothing is clipped.
+            # silence.threshold = 24000
         }
     }
 ]

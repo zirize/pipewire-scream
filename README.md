@@ -29,6 +29,7 @@ This module provides Linux/PipeWire equivalent functionality to the Windows Scre
 - Multicast (default: 239.255.77.77:4010) and unicast support
 - Configurable sample rates, bit depths, and channel configurations
 - Low latency audio transmission
+- **Silence suppression** - stops transmitting when the sink is quiet (`silence.threshold`)
 - Compatible with existing Scream receivers
 - Stable for long-duration playback
 

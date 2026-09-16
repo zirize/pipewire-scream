@@ -36,6 +36,8 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdbool.h>
+#include <inttypes.h>
 #include <string.h>
 #include <errno.h>
 #include <unistd.h>
@@ -64,6 +66,11 @@
 #define MAX_MULTICAST_TTL 255
 #define PARAM_BUFFER_SIZE 1024
 #define MAX_CONSECUTIVE_SEND_FAILURES 100
+
+/* Silence suppression: stop transmitting after this many consecutive silent frames.
+ * 24000 frames is half a second at 48 kHz. Set silence.threshold=0 to transmit always. */
+#define DEFAULT_SILENCE_FRAMES 24000
+#define MAX_SILENCE_FRAMES 100000000L
 
 /* Sample rate encoding for Scream protocol */
 #define RATE_BASE_48K 0
@@ -131,6 +138,11 @@ struct scream_sink_data {
     
     /* Scream protocol state */
     uint8_t packet_buffer[SCREAM_HEADER_SIZE + SCREAM_MAX_PAYLOAD];
+    
+    /* Silence suppression */
+    uint64_t silence_threshold;   /* consecutive silent frames before we stop; 0 = never stop */
+    uint64_t silent_frames;       /* how many we have seen in a row */
+    bool suppressing;             /* currently withholding packets (for one-shot logging) */
     
     /* Error tracking */
     unsigned int consecutive_send_failures;
@@ -224,6 +236,33 @@ static void create_scream_header(struct scream_sink_data *data, uint8_t *header)
     header[4] = (channel_mask >> 8) & 0xFF;
 }
 
+/* Is this buffer entirely zero?
+ *
+ * Silence is all-zero bytes in every format this module sends - S16/S24/S32 little-endian
+ * and F32 alike - so a byte-wise test is both correct and format-agnostic.
+ */
+static bool buffer_is_silent(const uint8_t *p, size_t n)
+{
+    size_t i = 0;
+    
+    /* Word-at-a-time for the bulk; memcpy keeps this well-defined on unaligned input
+     * and compiles to a plain load. */
+    while (i + sizeof(uint64_t) <= n) {
+        uint64_t v;
+        memcpy(&v, p + i, sizeof(v));
+        if (v != 0) {
+            return false;
+        }
+        i += sizeof(uint64_t);
+    }
+    for (; i < n; i++) {
+        if (p[i] != 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
 /* Send audio packet over network */
 static int send_scream_packet(struct scream_sink_data *data, const void *audio_data, size_t size)
 {
@@ -308,6 +347,39 @@ static void on_stream_process(void *userdata)
     if (bytes_per_frame == 0) {
         pw_log_error("Bytes per frame is zero, aborting processing.");
         goto done;
+    }
+
+    /* Silence suppression - do not put silence on the wire.
+     *
+     * Without this the sink transmits ~1.5 Mbps of zeroes for as long as anything is attached
+     * to it, even when every source is quiet. On a battery-powered receiver that is the entire
+     * cost of the feature. Upstream Scream solves the same problem with its SilenceThreshold
+     * registry value, and this is the same idea with the same name.
+     *
+     * A receiver cannot distinguish "silence" from "nothing arrived" - the protocol has no
+     * keepalive - so receivers already have to treat a gap as silence.
+     *
+     * The threshold gates *stopping*, never starting: the first non-silent buffer is sent
+     * immediately, so no audio is ever clipped at the front of a sound.
+     */
+    if (data->silence_threshold > 0) {
+        if (buffer_is_silent(src, size)) {
+            data->silent_frames += size / bytes_per_frame;
+            if (data->silent_frames > data->silence_threshold) {
+                if (!data->suppressing) {
+                    data->suppressing = true;
+                    pw_log_info("silence suppression: stopped transmitting after %" PRIu64
+                                " silent frames", data->silent_frames);
+                }
+                goto done;
+            }
+        } else if (data->suppressing) {
+            data->suppressing = false;
+            data->silent_frames = 0;
+            pw_log_info("silence suppression: resumed transmitting");
+        } else {
+            data->silent_frames = 0;
+        }
     }
 
     uint32_t max_payload_frames = SCREAM_MAX_PAYLOAD / bytes_per_frame;
@@ -684,6 +756,18 @@ int pipewire__module_init(struct pw_impl_module *module, const char *args)
         }
     } else {
         data->format.format = SPA_AUDIO_FORMAT_S16;
+    }
+
+    str = pw_properties_get(props, "silence.threshold");
+    if (str) {
+        long frames;
+        ret = parse_int_param(str, "silence threshold", 0, MAX_SILENCE_FRAMES, &frames);
+        if (ret < 0) {
+            goto error;
+        }
+        data->silence_threshold = (uint64_t)frames;
+    } else {
+        data->silence_threshold = DEFAULT_SILENCE_FRAMES;
     }
 
     data->context = context;

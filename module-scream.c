@@ -146,6 +146,7 @@ struct scream_sink_data {
     
     /* Error tracking */
     unsigned int consecutive_send_failures;
+    unsigned int dropped_would_block;   /* send buffer was full; packet dropped */
 };
 
 /* Module properties */
@@ -407,7 +408,18 @@ static void on_stream_process(void *userdata)
 
         if (chunk_size > 0) {
             int err = send_scream_packet(data, src + offset, chunk_size);
-            if (err < 0) {
+            if (err == -EAGAIN) {
+                /* Send buffer full (EWOULDBLOCK is the same value on Linux).
+                 * The packet is gone, but the link is not down - counting this
+                 * as a send failure would cry wolf. Report it separately, and
+                 * rate-limited, because one busy moment can drop many packets. */
+                data->consecutive_send_failures = 0;
+                if (++data->dropped_would_block >= MAX_CONSECUTIVE_SEND_FAILURES) {
+                    pw_log_warn("Dropped %u packets: send buffer full",
+                                data->dropped_would_block);
+                    data->dropped_would_block = 0;
+                }
+            } else if (err < 0) {
                 data->consecutive_send_failures++;
                 if (data->consecutive_send_failures >= MAX_CONSECUTIVE_SEND_FAILURES) {
                     pw_log_error("Too many consecutive send failures (%u), network may be down: %s",
@@ -491,8 +503,17 @@ static int init_network(struct scream_sink_data *data)
 {
     int ret;
     
-    /* Create UDP socket */
-    data->sockfd = socket(AF_INET, SOCK_DGRAM, 0);
+    /* Create UDP socket.
+     *
+     * SOCK_NONBLOCK matters: sendto() is called from the realtime thread. With a
+     * blocking socket, a full send buffer stalls that thread, and an xrun there
+     * hurts *every* stream in the graph - not just ours. Non-blocking turns the
+     * same situation into a dropped packet, which costs only our own audio, and
+     * which a Scream receiver already has to cope with: the protocol has no
+     * retransmission, so a gap on the wire is a gap either way.
+     *
+     * Trading a global stall for a local drop is the right way round. */
+    data->sockfd = socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK, 0);
     if (data->sockfd < 0) {
         pw_log_error("Failed to create socket: %s", strerror(errno));
         return -errno;
@@ -683,6 +704,7 @@ int pipewire__module_init(struct pw_impl_module *module, const char *args)
     data->sockfd = -1;
     data->multicast_ttl = DEFAULT_MULTICAST_TTL;
     data->consecutive_send_failures = 0;
+    data->dropped_would_block = 0;
 
     props = args ? pw_properties_new_string(args) : pw_properties_new(NULL, NULL);
     if (!props) {

@@ -1,5 +1,7 @@
 # Scream PipeWire Sender Module
 
+📄 Project page: **[Scream sender for PipeWire — stream Linux audio over the network as raw PCM](https://zirize.github.io/pipewire-scream/)** · More projects: **[zirize.github.io](https://zirize.github.io/)**
+
 A PipeWire module that creates a virtual audio sink and transmits audio over the network using the Scream protocol.
 
 **Part of the [Scream](https://github.com/duncanthrax/scream) ecosystem** - This is a Linux PipeWire implementation of the Scream sender. For receivers and the original Windows driver, see the [main Scream project](https://github.com/duncanthrax/scream).

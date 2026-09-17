@@ -330,8 +330,19 @@ static void on_stream_process(void *userdata)
         goto done;
     }
 
-    src = d[0].data;
-    size = d[0].chunk->size;
+    /* The valid audio starts at chunk->offset, not at the start of the mapped
+     * memory. It is zero in the common case, which is exactly why ignoring it
+     * is dangerous: nothing breaks until the day it is not, and then we quietly
+     * put the wrong bytes on the wire instead of failing. Clamp against the
+     * mapped size so a bad offset cannot walk off the end. */
+    {
+        uint32_t off = SPA_MIN(d[0].chunk->offset, d[0].maxsize);
+        size = SPA_MIN(d[0].chunk->size, d[0].maxsize - off);
+        if (size == 0) {
+            goto done;
+        }
+        src = SPA_PTROFF(d[0].data, off, uint8_t);
+    }
 
     uint32_t sample_size = get_sample_size(&data->format);
     uint32_t channels = data->format.channels;

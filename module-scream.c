@@ -582,9 +582,6 @@ static int create_sink_stream(struct scream_sink_data *data, struct pw_propertie
     struct pw_properties *stream_props = pw_properties_new(
         PW_KEY_MEDIA_TYPE, "Audio",
         PW_KEY_MEDIA_CATEGORY, "Playback",
-        PW_KEY_MEDIA_CLASS, "Audio/Sink",
-        PW_KEY_NODE_NAME, data->sink_name,
-        PW_KEY_NODE_DESCRIPTION, data->sink_description,
         PW_KEY_NODE_VIRTUAL, "true",
         PW_KEY_NODE_NETWORK, "true",
         NULL
@@ -594,6 +591,33 @@ static int create_sink_stream(struct scream_sink_data *data, struct pw_propertie
         ret = -ENOMEM;
         goto error;
     }
+
+    /* Let the user put arbitrary properties on the node.
+     *
+     * Everything here used to be a fixed list, so a property the module did not
+     * know about had no way to reach the node - node.pause-on-idle and
+     * node.latency among them. Callers had no workaround, because the node is
+     * created here and nowhere else.
+     *
+     * The nested form is what the PipeWire modules use (module-loopback has
+     * capture.props / playback.props), and it keeps the two namespaces apart:
+     * ip and port configure the module, stream.props configures the node.
+     * Adding a key is additive - existing configuration keeps working.
+     *
+     *   args = { ip = "..."  stream.props = { node.pause-on-idle = true } }
+     */
+    const char *stream_props_str = pw_properties_get(props, "stream.props");
+    if (stream_props_str) {
+        pw_properties_update_string(stream_props, stream_props_str,
+                                    strlen(stream_props_str));
+    }
+
+    /* Set last, so they cannot be overridden: the module does not work without
+     * this media class, and sink.name is the documented way to name the sink -
+     * having two keys that both set it would only be a way to disagree. */
+    pw_properties_set(stream_props, PW_KEY_MEDIA_CLASS, "Audio/Sink");
+    pw_properties_set(stream_props, PW_KEY_NODE_NAME, data->sink_name);
+    pw_properties_set(stream_props, PW_KEY_NODE_DESCRIPTION, data->sink_description);
 
     data->stream = pw_stream_new(data->core, data->sink_name, stream_props);
     if (!data->stream) {

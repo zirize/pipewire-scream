@@ -31,6 +31,16 @@ context.modules = [
             # channels = 2
             # format = "S16LE"    # Options: S16LE, S24LE, S32LE
 
+            # Arbitrary properties for the sink node itself.
+            # The module's own options (ip, port, rate, ...) configure the
+            # sender; stream.props configures the PipeWire node it creates.
+            # stream.props = {
+            #     node.pause-on-idle = true
+            #     node.latency       = 1024/48000
+            # }
+            # Note: sink.name and sink.description above are authoritative -
+            # setting node.name or node.description here has no effect.
+
             # Silence suppression: consecutive silent frames tolerated before
             # transmission stops. Default 24000 (~0.5 s at 48 kHz); 0 disables.
             # Transmission resumes on the first non-silent buffer, so nothing is clipped.

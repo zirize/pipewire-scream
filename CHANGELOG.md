@@ -17,6 +17,33 @@ All notable changes to the PipeWire Scream Sender module will be documented in t
 
   Mirrors the `SilenceThreshold` registry value of the upstream Windows Scream driver.
 
+- **`stream.props`** - arbitrary properties for the sink node.
+
+  The node's properties were a fixed list, so anything the module did not know about could not
+  reach the node, and callers had no workaround because the node is created here and nowhere
+  else. `node.pause-on-idle` and `node.latency` were among the casualties. The nested form
+  matches the PipeWire modules (`capture.props` / `playback.props` in module-loopback) and keeps
+  the namespaces apart: `ip` and `port` configure the sender, `stream.props` configures the node.
+
+  `sink.name` and `sink.description` stay authoritative, and `media.class` cannot be overridden.
+
+### Fixed
+- **Do not log from the realtime thread on send failure.** `send_scream_packet()` logged on every
+  failed `sendto()`. That runs in the realtime thread, and with the network down it fired once
+  per packet - defeating the rate limiting the caller already had. The caller now reports the
+  errno in the message it was already rate-limiting.
+
+- **Honour `chunk->offset`.** The valid audio in a PipeWire buffer starts at `chunk->offset`; we
+  read from the start of the mapping. It is zero in the common case, which is what made it worth
+  fixing - the failure mode is not a crash but the wrong bytes on the wire, which a receiver
+  cannot distinguish from signal. The size is now clamped against `maxsize` as well.
+
+- **Send from a non-blocking socket.** `sendto()` runs in the realtime thread; on a blocking
+  socket a full send buffer stalls it, and an xrun there hurts every stream in the graph. Now the
+  same situation drops one packet instead, which costs only this module's audio - and a Scream
+  receiver already has to cope with gaps, since the protocol has no retransmission. `EAGAIN` is
+  counted separately from real send errors so that local congestion is not reported as a dead link.
+
 ## [1.0.1] - 2026-02-07
 
 ### Fixed

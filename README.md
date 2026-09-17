@@ -139,6 +139,24 @@ context.modules = [
 | `rate` | int | `48000` | Default sample rate (8000-384000) |
 | `channels` | int | `2` | Default channel count (1-255) |
 | `format` | string | `S16LE` | Audio format (S16LE, S24LE, S32LE) |
+| `silence.threshold` | int | `24000` | Consecutive silent frames before transmission stops; `0` disables |
+| `stream.props` | object | (none) | Arbitrary properties for the sink node (see below) |
+
+The options above configure the *sender*. `stream.props` configures the PipeWire *node* the
+module creates, for properties the module has no option of its own for:
+
+```
+args = {
+    ip           = "192.168.1.100"
+    stream.props = {
+        node.pause-on-idle = true
+        node.latency       = 1024/48000
+    }
+}
+```
+
+`sink.name` and `sink.description` stay authoritative - setting `node.name` or
+`node.description` in `stream.props` has no effect - and `media.class` cannot be overridden.
 
 ## Receivers
 

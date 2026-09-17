@@ -285,7 +285,10 @@ static int send_scream_packet(struct scream_sink_data *data, const void *audio_d
                           sizeof(data->dest_addr));
     
     if (sent < 0) {
-        pw_log_error("Failed to send packet: %s", strerror(errno));
+        /* Do not log here. This runs in the realtime thread, and if the network is
+         * down every single packet fails - one log call per packet, which is both
+         * unsafe in an RT context and drowns the log. The caller rate-limits the
+         * reporting instead; all we owe it is the errno. */
         return -errno;
     }
     
@@ -392,11 +395,12 @@ static void on_stream_process(void *userdata)
                               max_payload_bytes : remaining;
 
         if (chunk_size > 0) {
-            if (send_scream_packet(data, src + offset, chunk_size) < 0) {
+            int err = send_scream_packet(data, src + offset, chunk_size);
+            if (err < 0) {
                 data->consecutive_send_failures++;
                 if (data->consecutive_send_failures >= MAX_CONSECUTIVE_SEND_FAILURES) {
-                    pw_log_error("Too many consecutive send failures (%u), network may be down",
-                                data->consecutive_send_failures);
+                    pw_log_error("Too many consecutive send failures (%u), network may be down: %s",
+                                data->consecutive_send_failures, spa_strerror(err));
                     /* Reset counter to avoid log spam */
                     data->consecutive_send_failures = 0;
                 }

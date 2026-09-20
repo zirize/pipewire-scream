@@ -158,6 +158,84 @@ args = {
 `sink.name` and `sink.description` stay authoritative - setting `node.name` or
 `node.description` in `stream.props` has no effect - and `media.class` cannot be overridden.
 
+## Advanced: Audio Relay (Mixing)
+
+`zirize/pipewire-scream` can also be used to turn your Linux PC into a central **Audio Relay**. This allows you to capture various inputs—such as a microphone, Line-In, or smartphone Bluetooth—and stream them over the network with zero latency to other devices.
+
+### 1. Preparation
+
+Follow the installation instructions above. Once installed, `libpipewire-module-scream.so` will be available in the PipeWire modules directory.
+
+### 2. Configure the Relay Sender
+
+Create a configuration file to automatically load the module. It is highly recommended to use **Unicast** (targeting the final receiving device, like your Android or Windows PC).
+
+```bash
+mkdir -p ~/.config/pipewire/pipewire.conf.d/
+```
+
+Create `~/.config/pipewire/pipewire.conf.d/scream-sender.conf`:
+```text
+context.modules = [
+    {
+        name = libpipewire-module-scream
+        args = {
+            ip = "192.168.1.100" # Change to the receiving device's IP
+            port = 4010
+            rate = 48000
+            format = "S16LE"
+            channels = 2
+            silence.threshold = 24000 # (Optional) Pause transmission on silence
+        }
+    }
+]
+```
+
+Restart PipeWire:
+```bash
+systemctl --user restart pipewire
+```
+
+### 3. Route the Audio
+
+Route your incoming audio sources (like a microphone or Bluetooth) into the Scream virtual sink.
+
+**Method A: GUI (Recommended)**
+Use patchbay apps like **qpwgraph** or **Helvum**. Simply drag a line from your Input Source's output pins to the **Scream** sink's input pins.
+
+**Method B: CLI (`pw-link`)**
+```bash
+pw-link -o # List sources (e.g., alsa_input...capture_FL)
+pw-link -i # List sinks (look for Scream...playback_FL)
+pw-link "Source_Name:capture_FL" "Scream:playback_FL"
+pw-link "Source_Name:capture_FR" "Scream:playback_FR"
+```
+
+**Method C: Persistent Loopback**
+Create `~/.config/pipewire/pipewire.conf.d/loopback-scream.conf`:
+```text
+context.modules = [
+    {
+        name = libpipewire-module-loopback
+        args = {
+            node.description = "Relay to Scream"
+            capture.props = {
+                node.target = "alsa_input.pci-0000_00_1f.3.analog-stereo" # Refer to 'pactl list sources'
+            }
+            playback.props = {
+                node.target = "Scream"
+            }
+        }
+    }
+]
+```
+
+### 4. Troubleshooting Relay Issues
+
+- **Stuttering / Latency:** Since Scream uses UDP, it is sensitive to packet loss. A wired ethernet connection is highly recommended.
+- **Sample Rate Mismatch:** Ensure the `rate` in your sender configuration matches the receiver's processing rate to avoid static noise.
+- **Network Optimization:** Set `silence.threshold = 24000` (approx 0.5s) to stop sending packets during silent periods, conserving network bandwidth.
+
 ## Receivers
 
 To receive the audio stream, use any Scream receiver:

@@ -19,6 +19,9 @@
 #include <pipewire/impl.h>
 #include <spa/param/audio/format-utils.h>
 #include <spa/utils/result.h>
+#include <spa/utils/json.h>
+#include <spa/utils/string.h>
+#include <pipewire/extensions/metadata.h>
 
 /* Version compatibility: PipeWire 1.0 removed media_type/media_subtype from spa_audio_info_raw */
 #if !PW_CHECK_VERSION(1, 0, 0)
@@ -44,6 +47,8 @@
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include <stdatomic.h>
+#include <time.h>
 
 #define MODULE_NAME "module-scream"
 #define DEFAULT_SINK_NAME "Scream"
@@ -71,6 +76,27 @@
  * 24000 frames is half a second at 48 kHz. Set silence.threshold=0 to transmit always. */
 #define DEFAULT_SILENCE_FRAMES 24000
 #define MAX_SILENCE_FRAMES 100000000L
+
+/* Control protocol (unicast button, auto output) - see TECHNICAL.md "Control protocol".
+ * Off unless discovery.port is set. Never touches the audio wire format. */
+#define CTRL_MAGIC "SCRMDRD1"
+#define CTRL_MAGIC_LEN 8
+#define CTRL_QUERY 1
+#define CTRL_TAKE 2
+#define CTRL_RELEASE 3
+#define CTRL_ANSWER 4
+#define CTRL_NOTICE 5
+#define CTRL_CONNECT 6
+#define CTRL_DISCONNECT 7
+#define CTRL_KEEPALIVE 8
+#define CTRL_NOTICE_TAKEN 1
+#define CTRL_NOTICE_OUTPUT_MOVED 2
+#define CTRL_NAME_MAX 32
+#define CTRL_MAX_PACKET 64
+#define CTRL_MAX_CONNECTED 4
+#define CTRL_MAX_ALLOW 8
+#define CTRL_SENDING_WINDOW_NS 1000000000ULL
+#define NODE_NAME_MAX 256
 
 /* Sample rate encoding for Scream protocol */
 #define RATE_BASE_48K 0
@@ -147,7 +173,56 @@ struct scream_sink_data {
     /* Error tracking */
     unsigned int consecutive_send_failures;
     unsigned int dropped_would_block;   /* send buffer was full; packet dropped */
+
+    /* Where the RT thread sends: s_addr << 16 | sin_port, both in network order.
+     * Written on the main loop, read once per buffer in on_stream_process(). One atomic
+     * word, so the RT side never takes a lock and never sees half an address. */
+    _Atomic uint64_t dest_packed;
+    _Atomic uint64_t last_send_ns;      /* CLOCK_MONOTONIC of the last packet put on the wire */
+
+    /* Control protocol - everything below lives on the main loop only */
+    int ctrl_port;                      /* 0 = feature off */
+    int ctrl_fd;
+    struct spa_source *ctrl_source;
+    uint32_t sender_id;
+    char nickname[CTRL_NAME_MAX + 1];
+    bool auto_output;
+    struct { uint32_t net, mask; } allow[CTRL_MAX_ALLOW];
+    int n_allow;
+
+    /* unicast button */
+    bool uni_active;
+    struct sockaddr_in uni_ctrl;        /* the phone's control socket (answers, notices) */
+    uint16_t uni_audio_port;            /* host order */
+
+    /* default output watch */
+    struct pw_registry *registry;
+    struct spa_hook registry_listener;
+    struct pw_metadata *metadata;
+    uint32_t metadata_id;
+    struct spa_hook metadata_listener;
+    bool is_default;
+    int default_expect;                    /* -1, or what we just asked WirePlumber for (0/1) */
+    char configured_sink[NODE_NAME_MAX];   /* default.configured.audio.sink */
+    char effective_sink[NODE_NAME_MAX];    /* default.audio.sink */
+
+    /* auto output */
+    struct { uint32_t instance; struct sockaddr_in addr; } connected[CTRL_MAX_CONNECTED];
+    int n_connected;
+    char remembered_sink[NODE_NAME_MAX];   /* "" = nothing to restore */
 };
+
+static inline uint64_t pack_dest(const struct sockaddr_in *a)
+{
+    return ((uint64_t)a->sin_addr.s_addr << 16) | (uint64_t)a->sin_port;
+}
+
+static inline uint64_t monotonic_ns(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
 
 /* Module properties */
 static const struct spa_dict_item module_props[] = {
@@ -265,7 +340,8 @@ static bool buffer_is_silent(const uint8_t *p, size_t n)
 }
 
 /* Send audio packet over network */
-static int send_scream_packet(struct scream_sink_data *data, const void *audio_data, size_t size)
+static int send_scream_packet(struct scream_sink_data *data, const struct sockaddr_in *dest,
+                              const void *audio_data, size_t size)
 {
     /* Validate size to prevent buffer overflow */
     if (size > SCREAM_MAX_PAYLOAD) {
@@ -282,8 +358,7 @@ static int send_scream_packet(struct scream_sink_data *data, const void *audio_d
     /* Send packet */
     ssize_t sent = sendto(data->sockfd, data->packet_buffer, 
                           SCREAM_HEADER_SIZE + size, 0,
-                          (struct sockaddr *)&data->dest_addr, 
-                          sizeof(data->dest_addr));
+                          (const struct sockaddr *)dest, sizeof(*dest));
     
     if (sent < 0) {
         /* Do not log here. This runs in the realtime thread, and if the network is
@@ -397,6 +472,18 @@ static void on_stream_process(void *userdata)
         }
     }
 
+    /* One atomic load per buffer: the control protocol may have switched the destination
+     * (unicast button). A stale value for one buffer is harmless. */
+    struct sockaddr_in dest;
+    {
+        uint64_t p = atomic_load_explicit(&data->dest_packed, memory_order_relaxed);
+        memset(&dest, 0, sizeof(dest));
+        dest.sin_family = AF_INET;
+        dest.sin_addr.s_addr = (uint32_t)(p >> 16);
+        dest.sin_port = (uint16_t)(p & 0xFFFF);
+    }
+    bool sent_any = false;
+
     uint32_t max_payload_frames = SCREAM_MAX_PAYLOAD / bytes_per_frame;
     uint32_t max_payload_bytes = max_payload_frames * bytes_per_frame;
 
@@ -407,7 +494,7 @@ static void on_stream_process(void *userdata)
                               max_payload_bytes : remaining;
 
         if (chunk_size > 0) {
-            int err = send_scream_packet(data, src + offset, chunk_size);
+            int err = send_scream_packet(data, &dest, src + offset, chunk_size);
             if (err == -EAGAIN) {
                 /* Send buffer full (EWOULDBLOCK is the same value on Linux).
                  * The packet is gone, but the link is not down - counting this
@@ -430,9 +517,14 @@ static void on_stream_process(void *userdata)
             } else {
                 /* Reset failure counter on success */
                 data->consecutive_send_failures = 0;
+                sent_any = true;
             }
         }
         offset += chunk_size;
+    }
+    if (sent_any) {
+        /* clock_gettime(CLOCK_MONOTONIC) is a vDSO read - no syscall, safe here */
+        atomic_store_explicit(&data->last_send_ns, monotonic_ns(), memory_order_relaxed);
     }
 
 done:
@@ -662,6 +754,553 @@ error:
     return ret;
 }
 
+/* ------------------------------------------------------------------------------------------
+ * Control protocol: unicast button and auto output (TECHNICAL.md "Control protocol").
+ *
+ * Everything in this section runs on the main loop. The only thing the RT thread sees is
+ * dest_packed (one atomic word) and last_send_ns.
+ * ------------------------------------------------------------------------------------------ */
+
+static void set_dest(struct scream_sink_data *data, const struct sockaddr_in *a)
+{
+    atomic_store_explicit(&data->dest_packed, pack_dest(a), memory_order_relaxed);
+}
+
+static const char *addr_str(const struct sockaddr_in *a, char *buf, size_t len)
+{
+    char ip[INET_ADDRSTRLEN];
+    inet_ntop(AF_INET, &a->sin_addr, ip, sizeof(ip));
+    snprintf(buf, len, "%s:%u", ip, ntohs(a->sin_port));
+    return buf;
+}
+
+/* Copy at most max bytes of a UTF-8 string, never cutting a character in half. */
+static void utf8_copy(char *dst, const char *src, size_t max)
+{
+    size_t n = strlen(src);
+    if (n > max) {
+        n = max;
+        while (n > 0 && ((unsigned char)src[n] & 0xC0) == 0x80) {
+            n--;
+        }
+    }
+    memcpy(dst, src, n);
+    dst[n] = '\0';
+}
+
+static bool ctrl_allowed(struct scream_sink_data *data, const struct sockaddr_in *from)
+{
+    if (data->n_allow == 0) {
+        return true;
+    }
+    uint32_t a = ntohl(from->sin_addr.s_addr);
+    for (int i = 0; i < data->n_allow; i++) {
+        if ((a & data->allow[i].mask) == data->allow[i].net) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* "192.168.144.0/24, 10.0.0.0/8" - separators: space, comma, semicolon */
+static int parse_allow(struct scream_sink_data *data, const char *str)
+{
+    char buf[512];
+    utf8_copy(buf, str, sizeof(buf) - 1);
+    char *save = NULL;
+    for (char *tok = strtok_r(buf, " ,;", &save); tok; tok = strtok_r(NULL, " ,;", &save)) {
+        if (data->n_allow >= CTRL_MAX_ALLOW) {
+            pw_log_error("discovery.allow: more than %d entries", CTRL_MAX_ALLOW);
+            return -EINVAL;
+        }
+        long bits = 32;
+        char *slash = strchr(tok, '/');
+        if (slash) {
+            *slash = '\0';
+            if (parse_int_param(slash + 1, "discovery.allow prefix", 0, 32, &bits) < 0) {
+                return -EINVAL;
+            }
+        }
+        struct in_addr in;
+        if (inet_pton(AF_INET, tok, &in) != 1) {
+            pw_log_error("discovery.allow: invalid address %s", tok);
+            return -EINVAL;
+        }
+        uint32_t mask = bits == 0 ? 0 : 0xFFFFFFFFu << (32 - bits);
+        data->allow[data->n_allow].mask = mask;
+        data->allow[data->n_allow].net = ntohl(in.s_addr) & mask;
+        data->n_allow++;
+    }
+    return 0;
+}
+
+static void ctrl_send(struct scream_sink_data *data, const struct sockaddr_in *to,
+                      const uint8_t *buf, size_t len)
+{
+    /* Non-blocking socket: a lost answer is covered by the phone's retry. */
+    if (sendto(data->ctrl_fd, buf, len, 0, (const struct sockaddr *)to, sizeof(*to)) < 0) {
+        char a[32];
+        pw_log_debug("control: send to %s failed: %s", addr_str(to, a, sizeof(a)),
+                     strerror(errno));
+    }
+}
+
+static size_t put_header(uint8_t *p, uint8_t type)
+{
+    memcpy(p, CTRL_MAGIC, CTRL_MAGIC_LEN);
+    p[8] = type;
+    return 9;
+}
+
+static void put_u32(uint8_t *p, uint32_t v)
+{
+    p[0] = v & 0xFF; p[1] = (v >> 8) & 0xFF; p[2] = (v >> 16) & 0xFF; p[3] = (v >> 24) & 0xFF;
+}
+
+static uint32_t get_u32(const uint8_t *p)
+{
+    return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
+}
+
+static size_t put_name(uint8_t *p, const char *name)
+{
+    size_t n = strlen(name);
+    p[0] = (uint8_t)n;
+    memcpy(p + 1, name, n);
+    return 1 + n;
+}
+
+static void ctrl_answer(struct scream_sink_data *data, const struct sockaddr_in *to,
+                        uint32_t request_id)
+{
+    uint8_t p[CTRL_MAX_PACKET];
+    size_t n = put_header(p, CTRL_ANSWER);
+    put_u32(p + n, request_id); n += 4;
+    put_u32(p + n, data->sender_id); n += 4;
+
+    uint8_t mode = 0;
+    if (data->uni_active) {
+        mode = data->uni_ctrl.sin_addr.s_addr == to->sin_addr.s_addr ? 1 : 2;
+    }
+    p[n++] = mode;
+
+    uint64_t last = atomic_load_explicit(&data->last_send_ns, memory_order_relaxed);
+    p[n++] = (last != 0 && monotonic_ns() - last < CTRL_SENDING_WINDOW_NS) ? 1 : 0;
+
+    /* Right after we wrote the default, WirePlumber has not confirmed it yet: report
+     * what we asked for, so the answer to a connect already says "default". */
+    bool is_def = data->default_expect >= 0 ? data->default_expect : data->is_default;
+    p[n++] = !data->auto_output ? 0 : (is_def ? 2 : 1);
+    n += put_name(p + n, data->nickname);
+    ctrl_send(data, to, p, n);
+}
+
+static void ctrl_notice(struct scream_sink_data *data, const struct sockaddr_in *to,
+                        uint8_t reason)
+{
+    uint8_t p[CTRL_MAX_PACKET];
+    size_t n = put_header(p, CTRL_NOTICE);
+    put_u32(p + n, data->sender_id); n += 4;
+    p[n++] = reason;
+    n += put_name(p + n, data->nickname);
+    ctrl_send(data, to, p, n);
+}
+
+static void uni_stop(struct scream_sink_data *data, uint8_t notice_reason)
+{
+    if (!data->uni_active) {
+        return;
+    }
+    char a[32];
+    data->uni_active = false;
+    set_dest(data, &data->dest_addr);
+    pw_log_info("control: back to %s:%d (was unicast to %s)", data->ip, data->port,
+                addr_str(&data->uni_ctrl, a, sizeof(a)));
+    if (notice_reason) {
+        ctrl_notice(data, &data->uni_ctrl, notice_reason);
+    }
+}
+
+/* ---- default output (PipeWire "default" metadata) ---- */
+
+/* WirePlumber stores {"name":"<node.name>"}; take the name, "" if absent. */
+static void parse_default_name(const char *value, char *out, size_t len)
+{
+    struct spa_json it[2];
+    char key[64];
+    const char *v;
+
+    out[0] = '\0';
+    if (value == NULL) {
+        return;
+    }
+    spa_json_init(&it[0], value, strlen(value));
+    if (spa_json_enter_object(&it[0], &it[1]) <= 0) {
+        return;
+    }
+    while (spa_json_get_string(&it[1], key, sizeof(key)) > 0) {
+        if (spa_streq(key, "name")) {
+            if (spa_json_get_string(&it[1], out, len) <= 0) {
+                out[0] = '\0';
+            }
+            return;
+        }
+        if (spa_json_next(&it[1], &v) <= 0) {
+            return;
+        }
+    }
+}
+
+static void set_default_sink(struct scream_sink_data *data, const char *name)
+{
+    char json[NODE_NAME_MAX * 2 + 16];
+    size_t j = 0;
+
+    if (data->metadata == NULL) {
+        pw_log_warn("control: no default metadata yet, cannot set the default output");
+        return;
+    }
+    j += snprintf(json, sizeof(json), "{\"name\":\"");
+    for (const char *s = name; *s && j < sizeof(json) - 4; s++) {
+        if (*s == '"' || *s == '\\') {
+            json[j++] = '\\';
+        }
+        json[j++] = *s;
+    }
+    json[j++] = '"';
+    json[j++] = '}';
+    json[j] = '\0';
+    pw_metadata_set_property(data->metadata, PW_ID_CORE, "default.configured.audio.sink",
+                             "Spa:String:JSON", json);
+    pw_log_info("control: default output -> %s", name);
+}
+
+static int on_metadata_property(void *userdata, uint32_t subject, const char *key,
+                                const char *type, const char *value)
+{
+    struct scream_sink_data *data = userdata;
+
+    if (subject != PW_ID_CORE) {
+        return 0;
+    }
+    if (key == NULL) {
+        /* everything cleared */
+        data->configured_sink[0] = '\0';
+        data->effective_sink[0] = '\0';
+        data->default_expect = -1;
+    } else if (spa_streq(key, "default.configured.audio.sink")) {
+        parse_default_name(value, data->configured_sink, sizeof(data->configured_sink));
+        return 0;
+    } else if (spa_streq(key, "default.audio.sink")) {
+        parse_default_name(value, data->effective_sink, sizeof(data->effective_sink));
+        data->default_expect = -1;
+    } else {
+        return 0;
+    }
+
+    bool now = spa_streq(data->effective_sink, data->sink_name);
+    bool was = data->is_default;
+    data->is_default = now;
+    if (was && !now) {
+        pw_log_info("control: %s is no longer the default output (now %s)", data->sink_name,
+                    data->effective_sink[0] ? data->effective_sink : "none");
+        /* Someone else moved it while phones are connected: their choice wins. */
+        if (data->n_connected > 0 && data->remembered_sink[0]) {
+            pw_log_info("control: output moved by hand; will not restore %s",
+                        data->remembered_sink);
+            data->remembered_sink[0] = '\0';
+        }
+        uni_stop(data, CTRL_NOTICE_OUTPUT_MOVED);
+    }
+    return 0;
+}
+
+static const struct pw_metadata_events metadata_events = {
+    PW_VERSION_METADATA_EVENTS,
+    .property = on_metadata_property,
+};
+
+static void unbind_metadata(struct scream_sink_data *data)
+{
+    if (data->metadata) {
+        spa_hook_remove(&data->metadata_listener);
+        pw_proxy_destroy((struct pw_proxy *)data->metadata);
+        data->metadata = NULL;
+    }
+}
+
+static void on_registry_global(void *userdata, uint32_t id, uint32_t permissions,
+                               const char *type, uint32_t version, const struct spa_dict *props)
+{
+    struct scream_sink_data *data = userdata;
+    const char *name;
+
+    if (!spa_streq(type, PW_TYPE_INTERFACE_Metadata) || props == NULL) {
+        return;
+    }
+    name = spa_dict_lookup(props, PW_KEY_METADATA_NAME);
+    if (!spa_streq(name, "default")) {
+        return;
+    }
+    unbind_metadata(data);
+    data->metadata = pw_registry_bind(data->registry, id, PW_TYPE_INTERFACE_Metadata,
+                                      PW_VERSION_METADATA, 0);
+    if (data->metadata == NULL) {
+        pw_log_warn("control: cannot bind the default metadata");
+        return;
+    }
+    data->metadata_id = id;
+    pw_metadata_add_listener(data->metadata, &data->metadata_listener, &metadata_events, data);
+    pw_log_info("control: watching the default output");
+}
+
+static void on_registry_global_remove(void *userdata, uint32_t id)
+{
+    struct scream_sink_data *data = userdata;
+    /* WirePlumber restarting: drop it; a new global brings it back */
+    if (data->metadata && id == data->metadata_id) {
+        unbind_metadata(data);
+    }
+}
+
+static const struct pw_registry_events registry_events = {
+    PW_VERSION_REGISTRY_EVENTS,
+    .global = on_registry_global,
+    .global_remove = on_registry_global_remove,
+};
+
+/* ---- auto output ---- */
+
+static int connected_find(struct scream_sink_data *data, uint32_t instance)
+{
+    for (int i = 0; i < data->n_connected; i++) {
+        if (data->connected[i].instance == instance) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+static void auto_connect(struct scream_sink_data *data, uint32_t instance,
+                         const struct sockaddr_in *from, const char *dev)
+{
+    char a[32];
+    int i = connected_find(data, instance);
+
+    if (i >= 0) {
+        data->connected[i].addr = *from;     /* repeat, or the address changed */
+        return;
+    }
+    if (data->n_connected >= CTRL_MAX_CONNECTED) {
+        pw_log_warn("control: %d phones connected already, ignoring %s", CTRL_MAX_CONNECTED,
+                    addr_str(from, a, sizeof(a)));
+        return;
+    }
+    bool first = data->n_connected == 0;
+    data->connected[data->n_connected].instance = instance;
+    data->connected[data->n_connected].addr = *from;
+    data->n_connected++;
+    pw_log_info("control: connected %s (%s), %d now", addr_str(from, a, sizeof(a)), dev,
+                data->n_connected);
+
+    if (first && !data->is_default) {
+        const char *prev = data->configured_sink[0] ? data->configured_sink
+                                                    : data->effective_sink;
+        snprintf(data->remembered_sink, sizeof(data->remembered_sink), "%s", prev);
+        pw_log_info("control: remembering %s", prev[0] ? prev : "(none)");
+        set_default_sink(data, data->sink_name);
+        data->default_expect = 1;
+    }
+}
+
+static void auto_disconnect(struct scream_sink_data *data, uint32_t instance,
+                            const struct sockaddr_in *from)
+{
+    char a[32];
+    int i = connected_find(data, instance);
+
+    if (i < 0) {
+        return;                              /* repeat of a disconnect we already handled */
+    }
+    data->connected[i] = data->connected[--data->n_connected];
+    pw_log_info("control: disconnected %s, %d left", addr_str(from, a, sizeof(a)),
+                data->n_connected);
+    if (data->n_connected > 0) {
+        return;
+    }
+    if (data->remembered_sink[0] && data->is_default) {
+        /* If that device is gone, WirePlumber falls back to its own choice. */
+        set_default_sink(data, data->remembered_sink);
+        data->default_expect = 0;
+    }
+    data->remembered_sink[0] = '\0';
+}
+
+/* ---- the socket ---- */
+
+static bool read_name(const uint8_t *p, size_t len, size_t at, char *out, size_t outlen)
+{
+    if (at >= len) {
+        return false;
+    }
+    size_t n = p[at];
+    if (n > CTRL_NAME_MAX || at + 1 + n > len || n >= outlen) {
+        return false;
+    }
+    memcpy(out, p + at + 1, n);
+    out[n] = '\0';
+    /* for the log only: keep it printable */
+    for (size_t i = 0; i < n; i++) {
+        if ((unsigned char)out[i] < 0x20) {
+            out[i] = '?';
+        }
+    }
+    return true;
+}
+
+static void on_ctrl_io(void *userdata, int fd, uint32_t mask)
+{
+    struct scream_sink_data *data = userdata;
+    uint8_t p[256];
+    struct sockaddr_in from;
+    socklen_t fl;
+    ssize_t len;
+    char a[32], dev[CTRL_NAME_MAX + 1];
+
+    /* drain everything that is queued */
+    for (;;) {
+        fl = sizeof(from);
+        len = recvfrom(fd, p, sizeof(p), 0, (struct sockaddr *)&from, &fl);
+        if (len < 0) {
+            return;                          /* EAGAIN: done */
+        }
+        if (fl != sizeof(from) || from.sin_family != AF_INET) {
+            continue;
+        }
+        if (len < 13 || memcmp(p, CTRL_MAGIC, CTRL_MAGIC_LEN) != 0) {
+            continue;
+        }
+        if (!ctrl_allowed(data, &from)) {
+            continue;                        /* no answer reveals nothing */
+        }
+        uint8_t type = p[8];
+        uint32_t req = get_u32(p + 9);
+
+        switch (type) {
+        case CTRL_QUERY:
+            ctrl_answer(data, &from, req);
+            break;
+
+        case CTRL_TAKE: {
+            if (len < 16 || !read_name(p, len, 15, dev, sizeof(dev))) {
+                break;
+            }
+            uint16_t audio_port = (uint16_t)(p[13] | p[14] << 8);
+            if (audio_port == 0) {
+                break;
+            }
+            if (data->uni_active && data->uni_ctrl.sin_addr.s_addr != from.sin_addr.s_addr) {
+                char b[32];
+                pw_log_info("control: %s (%s) takes over from %s", addr_str(&from, a, sizeof(a)),
+                            dev, addr_str(&data->uni_ctrl, b, sizeof(b)));
+                ctrl_notice(data, &data->uni_ctrl, CTRL_NOTICE_TAKEN);
+            }
+            data->uni_active = true;
+            data->uni_ctrl = from;
+            data->uni_audio_port = audio_port;
+            struct sockaddr_in d = from;
+            d.sin_port = htons(audio_port);
+            set_dest(data, &d);
+            pw_log_info("control: unicast to %s (%s)", addr_str(&d, a, sizeof(a)), dev);
+            ctrl_answer(data, &from, req);
+            break;
+        }
+
+        case CTRL_RELEASE:
+            if (data->uni_active && data->uni_ctrl.sin_addr.s_addr == from.sin_addr.s_addr) {
+                uni_stop(data, 0);
+            }
+            ctrl_answer(data, &from, req);
+            break;
+
+        case CTRL_CONNECT:
+            if (len < 18 || !read_name(p, len, 17, dev, sizeof(dev))) {
+                break;
+            }
+            if (data->auto_output) {
+                auto_connect(data, get_u32(p + 13), &from, dev);
+            }
+            ctrl_answer(data, &from, req);
+            break;
+
+        case CTRL_DISCONNECT:
+            if (len < 17) {
+                break;
+            }
+            if (data->auto_output) {
+                auto_disconnect(data, get_u32(p + 13), &from);
+            }
+            ctrl_answer(data, &from, req);
+            break;
+
+        default:                             /* keepalive (reserved) and unknown types */
+            break;
+        }
+    }
+}
+
+static void ctrl_start(struct scream_sink_data *data)
+{
+    struct sockaddr_in a;
+
+    data->ctrl_fd = socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    if (data->ctrl_fd < 0) {
+        pw_log_warn("control: socket failed (%s); feature off", strerror(errno));
+        return;
+    }
+    memset(&a, 0, sizeof(a));
+    a.sin_family = AF_INET;
+    a.sin_addr.s_addr = htonl(INADDR_ANY);
+    a.sin_port = htons(data->ctrl_port);
+    /* No SO_REUSEADDR on purpose: a second instance on this host must fail here and run
+     * with the feature off, instead of two senders both answering and both sending. */
+    if (bind(data->ctrl_fd, (struct sockaddr *)&a, sizeof(a)) < 0) {
+        pw_log_warn("control: cannot bind UDP %d (%s) - another instance has it; feature off",
+                    data->ctrl_port, strerror(errno));
+        close(data->ctrl_fd);
+        data->ctrl_fd = -1;
+        return;
+    }
+    data->ctrl_source = pw_loop_add_io(pw_context_get_main_loop(data->context), data->ctrl_fd,
+                                       SPA_IO_IN, false, on_ctrl_io, data);
+
+    data->registry = pw_core_get_registry(data->core, PW_VERSION_REGISTRY, 0);
+    if (data->registry) {
+        pw_registry_add_listener(data->registry, &data->registry_listener, &registry_events,
+                                 data);
+    }
+    pw_log_info("control: listening on UDP %d as \"%s\"%s", data->ctrl_port, data->nickname,
+                data->auto_output ? ", auto output on" : "");
+}
+
+static void ctrl_stop(struct scream_sink_data *data)
+{
+    unbind_metadata(data);
+    if (data->registry) {
+        spa_hook_remove(&data->registry_listener);
+        pw_proxy_destroy((struct pw_proxy *)data->registry);
+        data->registry = NULL;
+    }
+    if (data->ctrl_source) {
+        pw_loop_destroy_source(pw_context_get_main_loop(data->context), data->ctrl_source);
+        data->ctrl_source = NULL;
+    }
+    if (data->ctrl_fd >= 0) {
+        close(data->ctrl_fd);
+        data->ctrl_fd = -1;
+    }
+}
+
 /* Core events */
 static void on_core_error(void *userdata, uint32_t id, int seq, int res, const char *message)
 {
@@ -679,6 +1318,8 @@ static void module_destroy(void *data)
     struct scream_sink_data *d = data;
     
     pw_log_info("Module destroy called");
+
+    ctrl_stop(d);
     
     /* Clean up socket */
     if (d->sockfd >= 0) {
@@ -729,6 +1370,8 @@ int pipewire__module_init(struct pw_impl_module *module, const char *args)
     data->multicast_ttl = DEFAULT_MULTICAST_TTL;
     data->consecutive_send_failures = 0;
     data->dropped_would_block = 0;
+    data->ctrl_fd = -1;
+    data->default_expect = -1;
 
     props = args ? pw_properties_new_string(args) : pw_properties_new(NULL, NULL);
     if (!props) {
@@ -831,6 +1474,37 @@ int pipewire__module_init(struct pw_impl_module *module, const char *args)
         data->silence_threshold = DEFAULT_SILENCE_FRAMES;
     }
 
+    set_dest(data, &data->dest_addr);
+
+    str = pw_properties_get(props, "discovery.port");
+    if (str) {
+        long cport;
+        ret = parse_int_param(str, "discovery.port", 0, MAX_PORT, &cport);
+        if (ret < 0) {
+            goto error;
+        }
+        data->ctrl_port = (int)cport;
+    }
+    str = pw_properties_get(props, "discovery.name");
+    if (str && *str) {
+        utf8_copy(data->nickname, str, CTRL_NAME_MAX);
+    } else {
+        char host[256] = "";
+        gethostname(host, sizeof(host) - 1);
+        utf8_copy(data->nickname, host, CTRL_NAME_MAX);
+    }
+    str = pw_properties_get(props, "discovery.auto.output");
+    data->auto_output = str && spa_atob(str);
+    str = pw_properties_get(props, "discovery.allow");
+    if (str && (ret = parse_allow(data, str)) < 0) {
+        goto error;
+    }
+    {
+        /* any value works; it only has to differ between module loads */
+        uint64_t t = monotonic_ns() ^ ((uint64_t)getpid() << 32);
+        data->sender_id = (uint32_t)(t ^ (t >> 32));
+    }
+
     data->context = context;
     data->core = pw_context_connect(context, NULL, 0);
     if (!data->core) {
@@ -842,6 +1516,10 @@ int pipewire__module_init(struct pw_impl_module *module, const char *args)
 
     if ((ret = create_sink_stream(data, props)) < 0) {
         goto error;
+    }
+
+    if (data->ctrl_port > 0) {
+        ctrl_start(data);
     }
 
     pw_impl_module_add_listener(module, &data->module_listener, &module_events, data);

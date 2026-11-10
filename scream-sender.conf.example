@@ -45,6 +45,16 @@ context.modules = [
             # transmission stops. Default 24000 (~0.5 s at 48 kHz); 0 disables.
             # Transmission resumes on the first non-silent buffer, so nothing is clipped.
             # silence.threshold = 24000
+
+            # Control protocol (off unless discovery.port is set). A receiver app can
+            # ask this sender to unicast to it instead of the configured address, and
+            # (with auto.output) make this sink the default output while it is
+            # connected. See TECHNICAL.md "Control protocol". Open the UDP port in
+            # your firewall for the LAN only.
+            # discovery.port = 4009
+            # discovery.name = "Living room PC"
+            # discovery.auto.output = false
+            # discovery.allow = "192.168.1.0/24"
         }
     }
 ]

@@ -30,6 +30,9 @@ This module provides Linux/PipeWire equivalent functionality to the Windows Scre
 - Configurable sample rates, bit depths, and channel configurations
 - Low latency audio transmission
 - **Silence suppression** - stops transmitting when the sink is quiet (`silence.threshold`)
+- **Control protocol** (optional, off by default) - a receiver can ask the sender to switch from
+  multicast to unicast-to-that-receiver and back, and can make the sink the default output while
+  it is connected (`discovery.*`, see TECHNICAL.md)
 - Compatible with existing Scream receivers
 - Stable for long-duration playback
 
@@ -141,6 +144,10 @@ context.modules = [
 | `format` | string | `S16LE` | Audio format (S16LE, S24LE, S32LE) |
 | `silence.threshold` | int | `24000` | Consecutive silent frames before transmission stops; `0` disables |
 | `stream.props` | object | (none) | Arbitrary properties for the sink node (see below) |
+| `discovery.port` | int | `0` (off) | UDP port for the control protocol (e.g. `4009`) |
+| `discovery.name` | string | host name | Nickname sent to receivers (max 32 bytes UTF-8) |
+| `discovery.auto.output` | bool | `false` | Make this sink the default output while a receiver is connected; restore the previous one when the last leaves |
+| `discovery.allow` | string | (any) | Only answer these networks, e.g. `"192.168.1.0/24, 10.0.0.0/8"` |
 
 The options above configure the *sender*. `stream.props` configures the PipeWire *node* the
 module creates, for properties the module has no option of its own for:

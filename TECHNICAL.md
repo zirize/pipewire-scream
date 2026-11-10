@@ -225,6 +225,64 @@ This mirrors the `SilenceThreshold` registry value of the upstream Windows Screa
 Receivers need no changes: the Scream protocol has no keepalive, so a receiver already cannot
 distinguish "silence" from "nothing arrived" and has to treat a gap as silence.
 
+## Control protocol
+
+Optional and off by default (`discovery.port = 0`). It never changes the audio packets above;
+it is a separate UDP protocol on its own port, used by the ScreamDroid receiver app.
+
+### Keys
+
+| key | default | meaning |
+|---|---|---|
+| `discovery.port` | `0` (off) | UDP port to listen on (ScreamDroid uses `4009`) |
+| `discovery.name` | host name | nickname in answers, UTF-8, cut to 32 bytes at a character boundary |
+| `discovery.auto.output` | `false` | auto output, below |
+| `discovery.allow` | (any) | CIDR list; other sources get no answer at all |
+
+### Packets
+
+All start with the 8-byte magic `SCRMDRD1` and a type byte. Integers are little-endian; names
+are a length byte (0-32) followed by UTF-8. Unknown or short packets are ignored.
+
+Receiver -> sender:
+
+| type | name | fields after byte 8 |
+|---|---|---|
+| 1 | query | request id (u32) |
+| 2 | take | request id · audio port (u16) · name |
+| 3 | release | request id |
+| 6 | connect | request id · instance id (u32) · name |
+| 7 | disconnect | request id · instance id |
+| 8 | keepalive | reserved, ignored |
+
+Sender -> receiver:
+
+| type | name | fields after byte 8 |
+|---|---|---|
+| 4 | answer | request id · sender id (u32, random per load) · mode (0 configured address, 1 unicast to you, 2 unicast to another) · sending now (0/1, a packet in the last second) · auto output (0 off, 1 not default, 2 default) · nickname |
+| 5 | notice | sender id · reason (1 taken by another receiver, 2 sink stopped being the default) · nickname |
+
+### Behaviour
+
+- **take**: audio goes to the packet's source address at the given port. Last take wins; the
+  previous receiver gets notice 1. **release** from that receiver restores the configured address.
+- The sink stops being the default output (`default.audio.sink` in the PipeWire `default`
+  metadata) ⇒ back to the configured address, notice 2.
+- **Auto output**: the first *connect* remembers `default.configured.audio.sink` and makes this
+  sink the default; the last *disconnect* writes the remembered one back. If the default is moved
+  away from the sink while receivers are connected, that was the user's choice: nothing is
+  restored. Up to 4 receivers are tracked, by instance id.
+- State lives only in memory: a module restart starts at the configured address, nobody connected.
+
+### Threads
+
+Socket, parsing, logging, the registry and the metadata all live on the main loop
+(`pw_loop_add_io`). The RT thread reads the destination as one 64-bit atomic word per buffer
+(address << 16 | port) and stores the time of its last send - no locks, no allocation.
+
+The control socket is bound without `SO_REUSEADDR` on purpose: a second instance on the same host
+fails to bind, logs a warning and runs with the feature off.
+
 ## Debugging
 
 ### Enable Debug Logging

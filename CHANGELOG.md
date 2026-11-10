@@ -2,6 +2,21 @@
 
 All notable changes to the PipeWire Scream Sender module will be documented in this file.
 
+## [Unreleased]
+
+### Added
+- **Control protocol** (`discovery.port`, off by default). A receiver can query the sender
+  (nickname, mode, whether it is sending), ask it to unicast to that receiver only (*take*),
+  and send it back to the configured address (*release*). The sender also goes back by itself
+  when its sink stops being the default output, and tells the receiver with a *notice*.
+  Optional **auto output** (`discovery.auto.output`): a receiver that *connects* makes the sink
+  the default output; when the last one *disconnects*, the previous default is restored, unless
+  the user moved it by hand meanwhile. Format in TECHNICAL.md "Control protocol".
+
+  The RT thread only gains one atomic load per buffer (the destination); all parsing, logging
+  and metadata work stays on the main loop. A second instance on the same host cannot bind the
+  port and runs with the feature off, so two senders never answer for one host.
+
 ## [1.0.2] - 2026-09-17
 
 ### Added

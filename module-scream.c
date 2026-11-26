@@ -1089,25 +1089,28 @@ static void auto_connect(struct scream_sink_data *data, uint32_t instance,
 
     if (i >= 0) {
         data->connected[i].addr = *from;     /* repeat, or the address changed */
-        return;
-    }
-    if (data->n_connected >= CTRL_MAX_CONNECTED) {
+    } else if (data->n_connected >= CTRL_MAX_CONNECTED) {
         pw_log_warn("control: %d phones connected already, ignoring %s", CTRL_MAX_CONNECTED,
                     addr_str(from, a, sizeof(a)));
         return;
+    } else {
+        data->connected[data->n_connected].instance = instance;
+        data->connected[data->n_connected].addr = *from;
+        data->n_connected++;
+        pw_log_info("control: connected %s (%s), %d now", addr_str(from, a, sizeof(a)), dev,
+                    data->n_connected);
     }
-    bool first = data->n_connected == 0;
-    data->connected[data->n_connected].instance = instance;
-    data->connected[data->n_connected].addr = *from;
-    data->n_connected++;
-    pw_log_info("control: connected %s (%s), %d now", addr_str(from, a, sizeof(a)), dev,
-                data->n_connected);
 
-    if (first && !data->is_default) {
-        const char *prev = data->configured_sink[0] ? data->configured_sink
-                                                    : data->effective_sink;
-        snprintf(data->remembered_sink, sizeof(data->remembered_sink), "%s", prev);
-        pw_log_info("control: remembering %s", prev[0] ? prev : "(none)");
+    /* A connect is a fresh press on the phone, not only the first phone arriving: if the
+     * output was moved away by hand since (which also dropped the remembered sink), move it
+     * back here and remember the output it is on now. */
+    if (!data->is_default && data->default_expect != 1) {
+        if (!data->remembered_sink[0]) {
+            const char *prev = data->configured_sink[0] ? data->configured_sink
+                                                        : data->effective_sink;
+            snprintf(data->remembered_sink, sizeof(data->remembered_sink), "%s", prev);
+            pw_log_info("control: remembering %s", prev[0] ? prev : "(none)");
+        }
         set_default_sink(data, data->sink_name);
         data->default_expect = 1;
     }

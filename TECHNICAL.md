@@ -268,10 +268,12 @@ Sender -> receiver:
   previous receiver gets notice 1. **release** from that receiver restores the configured address.
 - The sink stops being the default output (`default.audio.sink` in the PipeWire `default`
   metadata) ⇒ back to the configured address, notice 2.
-- **Auto output**: the first *connect* remembers `default.configured.audio.sink` and makes this
-  sink the default; the last *disconnect* writes the remembered one back. If the default is moved
-  away from the sink while receivers are connected, that was the user's choice: nothing is
-  restored. Up to 4 receivers are tracked, by instance id.
+- **Auto output**: a *connect* while this sink is not the default remembers
+  `default.configured.audio.sink` (unless one is remembered already) and makes this sink the
+  default; the last *disconnect* writes the remembered one back. If the default is moved away
+  from the sink while receivers are connected, that was the user's choice: the remembered one is
+  dropped and nothing is restored, until the next *connect* (a fresh press on the receiver, even
+  from one already connected) moves it here again. Up to 4 receivers are tracked, by instance id.
 - State lives only in memory: a module restart starts at the configured address, nobody connected.
 
 ### Threads

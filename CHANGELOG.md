@@ -11,7 +11,8 @@ All notable changes to the PipeWire Scream Sender module will be documented in t
   when its sink stops being the default output, and tells the receiver with a *notice*.
   Optional **auto output** (`discovery.auto.output`): a receiver that *connects* makes the sink
   the default output; when the last one *disconnects*, the previous default is restored, unless
-  the user moved it by hand meanwhile. Format in TECHNICAL.md "Control protocol".
+  the user moved it by hand meanwhile. A later *connect* (also from a receiver already
+  connected) moves the default back to the sink. Format in TECHNICAL.md "Control protocol".
 
   The RT thread only gains one atomic load per buffer (the destination); all parsing, logging
   and metadata work stays on the main loop. A second instance on the same host cannot bind the

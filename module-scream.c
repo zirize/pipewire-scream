@@ -802,7 +802,7 @@ static bool ctrl_allowed(struct scream_sink_data *data, const struct sockaddr_in
     return false;
 }
 
-/* "192.168.144.0/24, 10.0.0.0/8" - separators: space, comma, semicolon */
+/* "192.168.1.0/24, 10.0.0.0/8" - separators: space, comma, semicolon */
 static int parse_allow(struct scream_sink_data *data, const char *str)
 {
     char buf[512];

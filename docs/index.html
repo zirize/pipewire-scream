@@ -132,6 +132,38 @@ context.modules = [
 <tr><td><code>format</code></td><td>string</td><td><code>S16LE</code></td><td><code>S16LE</code>, <code>S24LE</code>, <code>S32LE</code></td></tr>
 </table>
 
+<h2>Advanced: Audio Relay (Mixing)</h2>
+<p><code>zirize/pipewire-scream</code> can turn your Linux PC into a central <strong>Audio Relay</strong>. This allows you to route various inputs (microphone, Line-In, Bluetooth) into the virtual sink and stream them with zero latency to other devices.</p>
+
+<h3>1. Configure the Relay Sender</h3>
+<p>It is recommended to use <strong>Unicast</strong> to target the specific receiving device.</p>
+<pre><code>mkdir -p ~/.config/pipewire/pipewire.conf.d/
+# Create scream-sender.conf
+context.modules = [
+    {
+        name = libpipewire-module-scream
+        args = {
+            ip = "192.168.1.100" # Receiving device's IP
+            silence.threshold = 24000 # Pause transmission on silence
+        }
+    }
+]</code></pre>
+
+<h3>2. Route the Audio</h3>
+<p>You must route incoming sources to the Scream virtual sink:</p>
+<ul>
+    <li><strong>Method A (GUI):</strong> Use <strong>qpwgraph</strong> or <strong>Helvum</strong> and visually connect the source pins to the Scream sink.</li>
+    <li><strong>Method B (CLI):</strong> Use <code>pw-link</code> to connect the ports (e.g., <code>pw-link "Source:capture_FL" "Scream:playback_FL"</code>).</li>
+    <li><strong>Method C (Persistent Loopback):</strong> Load <code>libpipewire-module-loopback</code> via a PipeWire conf file to automatically route a specific <code>node.target</code> (like an alsa_input) to the <code>Scream</code> sink.</li>
+</ul>
+
+<h3>3. Relay Tips</h3>
+<ul>
+    <li><strong>Stuttering:</strong> UDP is sensitive to packet loss. Wired ethernet is recommended.</li>
+    <li><strong>Mismatched Rates:</strong> Ensure the sample rate matches the receiver to avoid audio artifacts.</li>
+    <li><strong>Bandwidth:</strong> Use <code>silence.threshold</code> to pause network transmission during silent periods.</li>
+</ul>
+
 <h2>Receiving the stream</h2>
 <p>Any Scream receiver works. On Linux, the Unix receiver from the main Scream repository
 (<code>./scream -o pulse</code>); on Windows, ScreamReader from the Scream package. Receivers must
